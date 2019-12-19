@@ -4,33 +4,41 @@
 from __future__ import print_function
 
 import re, os, io, ast, pprint, collections
-from minilexer import MiniLexer
+from .minilexer import MiniLexer
 
 '''Verilog documentation parser'''
 
 verilog_tokens = {
   'root': [
+    (r'(`ifdef|`ifndef)\s+(\w+)', 'define'),
+    (r'`endif', 'endif'),
     (r'\bmodule\s+(\w+)\s*', 'module', 'module'),
     (r'/\*', 'block_comment', 'block_comment'),
     (r'//#+(.*)\n', 'metacomment'),
     (r'//.*\n', None),
   ],
   'module': [
+    (r'(`ifdef|`ifndef)\s+(\w+)', 'define'),
+    (r'`endif', 'endif'),
     (r'parameter\s*(signed|integer|realtime|real|time)?\s*(\[[^]]+\])?', 'parameter_start', 'parameters'),
-    (r'(input|inout|output)\s*(reg|supply0|supply1|tri|triand|trior|tri0|tri1|wire|wand|wor)?\s*(signed)?\s*(\[[^]]+\])?', 'module_port_start', 'module_port'),
+    (r'(input|inout|output)\s*(reg|supply0|supply1|tri|triand|trior|tri0|tri1|wire|wand|wor)?\s*(signed)?\s*(\[[`]?[^]]+\])?(\[[`]?[^]]+\])?', 'module_port_start', 'module_port'),
     (r'endmodule', 'end_module', '#pop'),
     (r'/\*', 'block_comment', 'block_comment'),
     (r'//#\s*{{(.*)}}\n', 'section_meta'),
     (r'//.*\n', None),
   ],
   'parameters': [
+    (r'(`ifdef|`ifndef)\s+(\w+)', 'define'),
+    (r'`endif', 'endif'),
     (r'\s*parameter\s*(signed|integer|realtime|real|time)?\s*(\[[^]]+\])?', 'parameter_start'),
-    (r'\s*(\w+)[^),;]*', 'param_item'),
+    (r'\s*(.+?)\s*=\s*([0-9]+)\s*', 'param_item'),
     (r',', None),
     (r'[);]', None, '#pop'),
   ],
   'module_port': [
-    (r'\s*(input|inout|output)\s*(reg|supply0|supply1|tri|triand|trior|tri0|tri1|wire|wand|wor)?\s*(signed)?\s*(\[[^]]+\])?', 'module_port_start'),
+    (r'(`ifdef|`ifndef)\s+(\w+)', 'define'),
+    (r'`endif', 'endif'),
+    (r'\s*(input|inout|output)\s*(reg|supply0|supply1|tri|triand|trior|tri0|tri1|wire|wand|wor)?\s*(signed)?\s*(\[[`]?[^]]+\])?(\[[`]?[^]]+\])?', 'module_port_start'),
     (r'\s*(\w+)\s*,?', 'port_param'),
     (r'[);]', None, '#pop'),
     (r'//#\s*{{(.*)}}\n', 'section_meta'),
@@ -47,15 +55,16 @@ VerilogLexer = MiniLexer(verilog_tokens)
 
 class VerilogObject(object):
   '''Base class for parsed Verilog objects'''
-  def __init__(self, name, desc=None):
+  def __init__(self, name, desc=None, define=None):
     self.name = name
     self.kind = 'unknown'
     self.desc = desc
+    self.define = define
 
-class VerilogParameter(object):
+class VerilogParameter(VerilogObject):
   '''Parameter and port to a module'''
-  def __init__(self, name, mode=None, data_type=None, default_value=None, desc=None):
-    self.name = name
+  def __init__(self, name, mode=None, data_type=None, default_value=None, desc=None, define=None):
+    super(VerilogParameter, self).__init__(name, desc, define)
     self.mode = mode
     self.data_type = data_type
     self.default_value = default_value
@@ -75,8 +84,8 @@ class VerilogParameter(object):
 
 class VerilogModule(VerilogObject):
   '''Module definition'''
-  def __init__(self, name, ports, generics=None, sections=None, desc=None):
-    VerilogObject.__init__(self, name, desc)
+  def __init__(self, name, ports, generics=None, sections=None, desc=None, define=None):
+    super(VerilogModule, self).__init__(name, desc, define)
     self.kind = 'module'
     # Verilog params
     self.generics = generics if generics is not None else []
@@ -125,10 +134,12 @@ def parse_verilog(text):
   port_param_index = 0
   last_item = None
   array_range_start_pos = 0
+  current_define = []
 
   objects = []
 
   for pos, action, groups in lex.run(text):
+    #print("pos: {}, action: {}, groups: {}".format(pos, action, groups))
     if action == 'metacomment':
       if last_item is None:
         metacomments.append(groups[0])
@@ -137,7 +148,12 @@ def parse_verilog(text):
 
     if action == 'section_meta':
       sections.append((port_param_index, groups[0]))
-
+    elif action == 'define':
+      current_define.append(groups[0] + "=" + groups[1])
+    elif action == 'endif':
+      if len(current_define) == 0:
+        raise Exception("No matching '`ifdef'' or '`ifndef' for the '`endif'")
+      current_define.pop()
     elif action == 'module':
       kind = 'module'
       name = groups[0]
@@ -146,7 +162,6 @@ def parse_verilog(text):
       param_items = []
       sections = []
       port_param_index = 0
-
     elif action == 'parameter_start':
       net_type, vec_range = groups
 
@@ -160,10 +175,10 @@ def parse_verilog(text):
       ptype = new_ptype
 
     elif action == 'param_item':
-      generics.append(VerilogParameter(groups[0], 'in', ptype))
+      generics.append(VerilogParameter(groups[0], 'in', ptype, groups[1], define=None if len(current_define) == 0 else current_define[-1]))
 
     elif action == 'module_port_start':
-      new_mode, net_type, signed, vec_range = groups
+      new_mode, net_type, signed, vec_range, array_spec = groups
 
       new_ptype = ''
       if net_type is not None:
@@ -175,9 +190,12 @@ def parse_verilog(text):
       if vec_range is not None:
         new_ptype += ' ' + vec_range
 
+      if array_spec is not None:
+        new_ptype += array_spec
+
       # Complete pending items
       for i in param_items:
-        ports[i] = VerilogParameter(i, mode, ptype)
+        ports[i] = VerilogParameter(i[0], mode, ptype, define=i[1])
 
       param_items = []
       if len(ports) > 0:
@@ -190,15 +208,18 @@ def parse_verilog(text):
     elif action == 'port_param':
       ident = groups[0]
 
-      param_items.append(ident)
+      param_items.append((ident, None if len(current_define) == 0 else current_define[-1]))
       port_param_index += 1
 
     elif action == 'end_module':
+      if len(current_define) > 0:
+        raise Exception("'%s' is not terminated with a matching '`endif'" % current_define[-1].replace('=',' '))
       # Finish any pending ports
       for i in param_items:
-        ports[i] = VerilogParameter(i, mode, ptype)
-
-      vobj = VerilogModule(name, ports.values(), generics, dict(sections), metacomments)
+        ports[i] = VerilogParameter(i[0], mode, ptype, define=i[1])
+      lports = list(ports.values())
+      lports.sort(key=lambda x: x.name)
+      vobj = VerilogModule(name, lports, generics, dict(sections), metacomments, define=None if len(current_define) == 0 else current_define[-1])
       objects.append(vobj)
       last_item = None
       metacomments = []
