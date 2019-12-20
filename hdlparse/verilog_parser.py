@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 # Copyright © 2017 Kevin Thibedeau
 # Distributed under the terms of the MIT license
-from __future__ import print_function
+
 
 import re, os, io, ast, pprint, collections
 from .minilexer import MiniLexer
@@ -21,7 +21,7 @@ verilog_tokens = {
     (r'(`ifdef|`ifndef)\s+(\w+)', 'define'),
     (r'`endif', 'endif'),
     (r'parameter\s*(signed|integer|realtime|real|time)?\s*(\[[^]]+\])?', 'parameter_start', 'parameters'),
-    (r'(input|inout|output)\s*(reg|supply0|supply1|tri|triand|trior|tri0|tri1|wire|wand|wor)?\s*(signed)?\s*(\[[`]?[^]]+\])?(\[[`]?[^]]+\])?', 'module_port_start', 'module_port'),
+    (r'(input|inout|output)([a-zA-Z0-9`:\s\[\]_-]+)', 'module_port_start', 'module_port'),
     (r'endmodule', 'end_module', '#pop'),
     (r'/\*', 'block_comment', 'block_comment'),
     (r'//#\s*{{(.*)}}\n', 'section_meta'),
@@ -38,7 +38,7 @@ verilog_tokens = {
   'module_port': [
     (r'(`ifdef|`ifndef)\s+(\w+)', 'define'),
     (r'`endif', 'endif'),
-    (r'\s*(input|inout|output)\s*(reg|supply0|supply1|tri|triand|trior|tri0|tri1|wire|wand|wor)?\s*(signed)?\s*(\[[`]?[^]]+\])?(\[[`]?[^]]+\])?', 'module_port_start'),
+    (r'\s*(input|inout|output)([a-zA-Z0-9`:\s\[\]_-]+)\s*,?', 'module_port_start'),
     (r'\s*(\w+)\s*,?', 'port_param'),
     (r'[);]', None, '#pop'),
     (r'//#\s*{{(.*)}}\n', 'section_meta'),
@@ -93,8 +93,6 @@ class VerilogModule(VerilogObject):
     self.sections = sections if sections is not None else {}
   def __repr__(self):
     return "VerilogModule('{}') {}".format(self.name, self.ports)
-
-
 
 def parse_verilog_file(fname):
   '''Parse a named Verilog file
@@ -178,7 +176,43 @@ def parse_verilog(text):
       generics.append(VerilogParameter(groups[0], 'in', ptype, groups[1], define=None if len(current_define) == 0 else current_define[-1]))
 
     elif action == 'module_port_start':
-      new_mode, net_type, signed, vec_range, array_spec = groups
+      new_mode, second_group = groups
+      #new_mode, net_type, signed, vec_range, array_spec = groups
+
+      net_type = None
+      signed = None
+      vec_range = None,
+      array_spec = None
+      port_name = None
+      second_group = second_group.strip()
+      # we have width
+      if '[' in second_group:
+        # splitting into the parts based on the width delimiter
+        # [31:0] name           ---> ['', '31:0] name']
+        # [31:0][15:0] name     ---> ['', '31:0]', '15:0] name']
+        # type[31:0] name       ---> ['type', '31:0] name']
+        # type[31:0][15:0] name ---> ['type', '31:0]', '15:0] name']
+        parts = second_group.split('[')
+        first_element = parts[0].strip()
+        # if there is a first element, then we have a type
+        if first_element:
+          net_type = first_element
+        width = parts[1].strip().split(']')
+        vec_range = "[" + width[0] + "]"
+        if len(parts) == 2:
+          # we do not have an array. Get the name
+          ident = width[1].strip()
+        elif len(parts) == 3:
+          array = parts[2].strip().split(']')
+          array_spec = "[" + array[0].strip() + "]"
+          ident = array[1].strip()
+        else:
+          raise Exception("Unknown port format: {} {}".format(new_mode, second_group))
+      else:
+        # there is no width or array specifier. Check if there is a type
+        ident = second_group.split()[-1]
+        if len(second_group.split()) > 1:
+          net_type = second_group.split()[0]
 
       new_ptype = ''
       if net_type is not None:
